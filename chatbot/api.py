@@ -167,26 +167,6 @@ async def evaluate_response(
         return None
 
 
-@app.get("/sources")
-async def get_sources(query: str):
-    """
-    Get relevant source documents for a query without generating a response.
-    """
-    rag_chain = get_rag_chain()
-    docs = rag_chain.get_relevant_documents(query)
-    return {"query": query, "documents": docs}
-
-
-@app.post("/reload")
-async def reload_documents():
-    """
-    Reload documents and rebuild the vector store.
-    """
-    rag_chain = get_rag_chain()
-    rag_chain.initialize(force_reload=True)
-    return {"status": "Documents reloaded successfully"}
-
-
 # Run with: uvicorn chatbot.api:app --port 8001 --reload
 if __name__ == "__main__":
     import uvicorn
