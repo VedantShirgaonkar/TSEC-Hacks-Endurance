@@ -32,6 +32,7 @@ class ChatRequest(BaseModel):
     message: str
     session_id: Optional[str] = None
     include_evaluation: bool = True  # Whether to run Endurance evaluation
+    custom_weights: Optional[Dict[str, float]] = None  # Department preset weights
 
 
 class ChatResponse(BaseModel):
@@ -99,6 +100,7 @@ async def chat(request: ChatRequest):
                 query=request.message,
                 response=response_text,
                 rag_documents=rag_documents,
+                custom_weights=request.custom_weights,
             )
         
         return ChatResponse(
@@ -119,20 +121,27 @@ async def evaluate_response(
     query: str,
     response: str,
     rag_documents: List[Dict[str, Any]],
+    custom_weights: Optional[Dict[str, float]] = None,
 ) -> Dict[str, Any]:
     """
     Call Endurance API to evaluate the response.
     """
     try:
+        payload = {
+            "session_id": session_id,
+            "query": query,
+            "response": response,
+            "rag_documents": rag_documents,
+        }
+        
+        # Add custom weights if provided
+        if custom_weights:
+            payload["custom_weights"] = custom_weights
+            
         async with httpx.AsyncClient(timeout=30.0) as client:
             eval_response = await client.post(
                 f"{ENDURANCE_URL}/v1/evaluate",
-                json={
-                    "session_id": session_id,
-                    "query": query,
-                    "response": response,
-                    "rag_documents": rag_documents,
-                },
+                json=payload,
             )
             
             if eval_response.status_code == 200:

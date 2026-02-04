@@ -67,7 +67,18 @@ def compute(
         explanation="Use of respectful and professional language"
     ))
     
-    # Metric 4: Human Feedback Score (from metadata if available)
+    # Metric 4: Tone Professionalism (CHATTINESS PENALTY)
+    # Penalize casual, informal, non-administrative language
+    tone_score = calculate_tone_professionalism(response)
+    metrics.append(MR(
+        name="tone_professionalism",
+        dimension="ethical_alignment",
+        raw_value=tone_score,
+        normalized_score=normalize_score(tone_score, 0, 1),
+        explanation=f"Administrative tone check (chatty penalty: {100*(1-tone_score):.0f}%)"
+    ))
+    
+    # Metric 5: Human Feedback Score (from metadata if available)
     human_score = metadata.get("human_feedback_score", 0.8)  # Default to 0.8 if not available
     metrics.append(MR(
         name="human_feedback",
@@ -170,3 +181,65 @@ def calculate_respectfulness(response: str) -> float:
             score -= 0.15
     
     return max(0, min(score, 1.0))
+
+
+def calculate_tone_professionalism(response: str) -> float:
+    """
+    CHATTINESS PENALTY: Detect and penalize non-administrative, casual tone.
+    
+    Severely penalizes:
+    - Greetings: "hey", "hi there", "buddy"
+    - Casual closings: "cheers", "take care"
+    - Exclamation marks
+    - Emoji characters
+    - Overly enthusiastic language
+    
+    Returns: Score 0.0-1.0 (low = chatty, high = professional)
+    """
+    score = 1.0
+    response_lower = response.lower()
+    
+    # SEVERE VIOLATIONS (each can cause major drop)
+    severe_penalties = [
+        (r'\b(hey|hi there|hello there)\b', 0.25),  # Casual greetings
+        (r'\bbuddy\b', 0.30),                        # Very informal
+        (r'\b(cheers|take care|best wishes|warm regards)\b', 0.15),  # Casual closings
+        (r'\b(gonna|wanna|gotta|kinda|sorta)\b', 0.20),  # Colloquialisms
+        (r'\b(awesome|amazing|fantastic|brilliant)\b', 0.10),  # Over-enthusiastic
+        (r'\b(lol|omg|btw|fyi)\b', 0.25),           # Text speak
+        (r'[\U0001F600-\U0001F64F\U0001F300-\U0001F5FF\U0001F680-\U0001F6FF]', 0.30),  # Emojis
+    ]
+    
+    for pattern, penalty in severe_penalties:
+        if re.search(pattern, response_lower):
+            score -= penalty
+    
+    # Exclamation mark penalty (cumulative)
+    exclamation_count = response.count('!')
+    if exclamation_count >= 3:
+        score -= 0.30  # Heavy penalty for excessive excitement
+    elif exclamation_count >= 1:
+        score -= 0.10 * exclamation_count
+    
+    # Question marks in RTI responses (should be statements)
+    question_count = response.count('?')
+    if question_count >= 2:
+        score -= 0.15
+    
+    # Check for phrases inappropriate in government context
+    inappropriate_phrases = [
+        (r'happy to help', 0.15),
+        (r'hope you like', 0.20),
+        (r'let me know', 0.10),
+        (r'feel free', 0.10),
+        (r'no worries', 0.15),
+        (r'don\'t hesitate', 0.10),
+    ]
+    
+    for phrase, penalty in inappropriate_phrases:
+        if re.search(phrase, response_lower):
+            score -= penalty
+    
+    # FLOOR at 0.0
+    return max(0.0, score)
+

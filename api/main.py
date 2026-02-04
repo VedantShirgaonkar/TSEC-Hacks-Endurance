@@ -75,6 +75,7 @@ class EvaluateRequest(BaseModel):
     response: str
     rag_documents: List[RAGDocument] = []
     metadata: Optional[Dict[str, Any]] = None
+    custom_weights: Optional[Dict[str, float]] = None  # Dynamic dimension weights
 
 
 class EvaluateResponse(BaseModel):
@@ -86,6 +87,7 @@ class EvaluateResponse(BaseModel):
     flagged: bool
     flag_reasons: List[str]
     timestamp: str
+    reasoning: Optional[List[Dict[str, Any]]] = None  # Explanations for low scores
 
 
 class SessionSummary(BaseModel):
@@ -242,63 +244,111 @@ async def evaluate(request: EvaluateRequest):
     Evaluate a chatbot response and return metrics.
     This is the main endpoint for SDK integration.
     """
+    # 1. Session & Service ID
     session_id = request.session_id or str(uuid4())
     service_id = request.service_id or "default"
+    
+    # 2. Log Query
+    log_event("QUERY_RECEIVED", session_id, {
+        "query": request.query[:100],
+        "rag_doc_count": len(request.rag_documents),
+    })
+    
+    # 3. Convert RAG Documents
+    rag_docs = [
+        RAGDocument(
+            id=doc.id,
+            source=doc.source,
+            content=doc.content,
+            page=doc.page,
+            similarity_score=doc.similarity_score,
+        )
+        for doc in request.rag_documents
+    ]
+    
+    # 4. Log RAG Retrieval
+    log_event("RAG_RETRIEVAL", session_id, {
+        "documents": [doc.source for doc in rag_docs],
+    })
+    
+    # 5. Verification (Robust)
+    verification_result = verify_response(request.response, rag_docs)
+    
+    log_event("VERIFICATION_COMPLETE", session_id, {
+        "total_claims": verification_result.total_claims,
+        "verified_claims": verification_result.verified_claims,
+        "hallucinated_claims": verification_result.hallucinated_claims,
+    })
+    
+    # 6. Metadata
+    metadata = request.metadata or {}
+    metadata["verified_claims"] = verification_result.verified_claims
+    metadata["total_claims"] = verification_result.total_claims
+    metadata["hallucinated_claims"] = verification_result.hallucinated_claims
+    
+    # 7. Compute Metrics (Robust with Reasoning)
+    evaluation = compute_all_metrics(
+        query=request.query,
+        response=request.response,
+        rag_documents=rag_docs,
+        metadata=metadata,
+        weights=request.custom_weights,
+    )
+    
+    # 8. Extract Dimensions
+    dimension_scores = {
+        name: dim.score for name, dim in evaluation.dimensions.items()
+    }
+    
+    # 9. Log Evaluation
+    log_event("EVALUATION_COMPLETE", session_id, {
+        "overall_score": evaluation.overall_score,
+        "dimensions": dimension_scores,
+    })
+    
+    # 10. Check Flags
+    # Create verification dict for check_flags
+    verification_dict = {
+        "total_claims": verification_result.total_claims,
+        "verified_claims": verification_result.verified_claims,
+        "hallucinated_claims": verification_result.hallucinated_claims,
+        "verification_score": verification_result.score
+    }
+    
+    flagged, flag_reasons = check_flags(evaluation.overall_score, dimension_scores, verification_dict)
+    
+    # 11. Store Session
     timestamp = datetime.now().isoformat()
-    
-    # Convert RAG documents to dict format
-    rag_docs = [doc.model_dump() for doc in request.rag_documents]
-    
-    # Compute metrics
-    dimensions = compute_dimensions(request.query, request.response, rag_docs)
-    
-    # Compute overall score (weighted average)
-    overall_score = sum(dimensions.values()) / len(dimensions) if dimensions else 0.0
-    
-    # Run verification
-    verification = compute_verification(request.response, rag_docs)
-    
-    # Apply verification penalty
-    if verification["verification_score"] < 100:
-        penalty = (100 - verification["verification_score"]) * 0.3
-        overall_score = max(0, overall_score - penalty)
-    
-    # Check for flags
-    flagged, flag_reasons = check_flags(overall_score, dimensions, verification)
-    
-    # Create session data
     session_data = {
         "session_id": session_id,
         "service_id": service_id,
         "query": request.query,
         "response": request.response,
-        "overall_score": overall_score,
-        "dimensions": dimensions,
-        "verification": verification,
+        "overall_score": evaluation.overall_score,
+        "dimensions": dimension_scores,
+        "verification": verification_dict,
         "flagged": flagged,
         "flag_reasons": flag_reasons,
         "timestamp": timestamp,
         "metadata": request.metadata,
+        "reasoning": evaluation.reasoning,
     }
     
-    # Store in memory
     sessions.appendleft(session_data)
-    
-    # Update service aggregates
     update_service_metrics(service_id, session_data)
-    
-    # Broadcast to SSE clients
     asyncio.create_task(broadcast_to_clients(session_data))
     
+    # 12. Return Response
     return EvaluateResponse(
         session_id=session_id,
         service_id=service_id,
-        overall_score=overall_score,
-        dimensions=dimensions,
-        verification=verification,
+        overall_score=evaluation.overall_score,
+        dimensions=dimension_scores,
+        verification=verification_dict,
         flagged=flagged,
         flag_reasons=flag_reasons,
         timestamp=timestamp,
+        reasoning=evaluation.reasoning,
     )
 
 

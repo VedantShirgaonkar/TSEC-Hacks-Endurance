@@ -96,20 +96,29 @@ def calculate_groundedness(response: str, rag_documents: list) -> tuple:
     """
     Calculate how grounded the response is in source documents.
     
+    UPGRADED: Uses semantic matching from verification module.
+    
     Returns: (groundedness_score, details_dict)
     """
     if not rag_documents:
         return 0.0, {"error": "No RAG documents provided"}
     
-    # Combine source content
-    source_content = ""
+    # Import the semantic matcher
+    try:
+        from endurance.verification.source_matcher import _semantic_match, _fuzzy_match, _exact_match
+        use_semantic = True
+    except ImportError:
+        use_semantic = False
+    
+    # Combine source content for matching
+    combined_source = ""
     for doc in rag_documents:
         if hasattr(doc, 'content'):
-            source_content += " " + doc.content.lower()
+            combined_source += " " + doc.content
         else:
-            source_content += " " + str(doc).lower()
+            combined_source += " " + str(doc)
     
-    # Extract claims from response (simple approach: split by sentences)
+    # Extract claims from response (split by sentences)
     sentences = re.split(r'[.!?]', response)
     sentences = [s.strip() for s in sentences if len(s.strip()) > 10]
     
@@ -121,24 +130,52 @@ def calculate_groundedness(response: str, rag_documents: list) -> tuple:
     details = {"claims": []}
     
     for sentence in sentences:
-        # Check if key terms from sentence appear in sources
-        words = sentence.lower().split()
-        key_words = [w for w in words if len(w) > 4]  # Focus on meaningful words
+        is_supported = False
+        confidence = 0.0
+        match_type = "NONE"
         
-        if not key_words:
-            continue
-        
-        matches = sum(1 for w in key_words if w in source_content)
-        match_ratio = matches / len(key_words) if key_words else 0
-        
-        is_supported = match_ratio > 0.3
+        if use_semantic:
+            # Try exact match first
+            exact_result = _exact_match(sentence, combined_source)
+            if exact_result:
+                is_supported = True
+                confidence = 1.0
+                match_type = "EXACT"
+            else:
+                # Try semantic match
+                semantic_result = _semantic_match(sentence, combined_source)
+                if semantic_result is not None:
+                    is_supported, confidence, match_type = semantic_result
+                else:
+                    # Fallback to fuzzy
+                    is_supported, confidence, match_type = _fuzzy_match(sentence, combined_source)
+        else:
+            # Fallback: basic word overlap (original logic)
+            words = sentence.lower().split()
+            key_words = [w for w in words if len(w) > 4]
+            source_lower = combined_source.lower()
+            
+            if key_words:
+                matches = sum(1 for w in key_words if w in source_lower)
+                match_ratio = matches / len(key_words)
+                is_supported = match_ratio > 0.3
+                confidence = match_ratio
         
         if is_supported:
             supported += 1
-            details["claims"].append({"text": sentence[:50], "status": "supported"})
+            details["claims"].append({
+                "text": sentence[:50], 
+                "status": "supported",
+                "confidence": round(confidence, 2),
+                "match_type": match_type,
+            })
         else:
             unsupported += 1
-            details["claims"].append({"text": sentence[:50], "status": "unsupported"})
+            details["claims"].append({
+                "text": sentence[:50], 
+                "status": "unsupported",
+                "confidence": round(confidence, 2),
+            })
     
     total = supported + unsupported
     details["total_claims"] = total
