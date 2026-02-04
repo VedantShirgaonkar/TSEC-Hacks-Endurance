@@ -231,8 +231,55 @@ def compute_all_metrics(
     )
 
 
+class MetricsEngine:
+    """Wrapper class for metrics computation."""
+    
+    def __init__(self, weights: Optional[Dict[str, float]] = None):
+        self.weights = weights or DEFAULT_WEIGHTS
+    
+    def evaluate(
+        self,
+        query: str,
+        response: str,
+        rag_documents: List[Any],
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Evaluate a query-response pair and return metrics."""
+        # Convert dicts to RAGDocument if needed
+        docs = []
+        for doc in rag_documents:
+            if isinstance(doc, dict):
+                docs.append(RAGDocument(
+                    id=doc.get("id", ""),
+                    source=doc.get("source", ""),
+                    content=doc.get("content", ""),
+                ))
+            else:
+                docs.append(doc)
+        
+        result = compute_all_metrics(
+            query=query,
+            response=response,
+            rag_documents=docs,
+            metadata=metadata,
+            weights=self.weights,
+        )
+        
+        # Convert to dict format
+        return {
+            "overall_score": result.overall_score,
+            "dimensions": {
+                name: dim.score for name, dim in result.dimensions.items()
+            },
+            "verified_claims": result.verified_claims,
+            "total_claims": result.total_claims,
+            "hallucinated_claims": result.hallucinated_claims,
+        }
+
+
 __all__ = [
     "compute_all_metrics",
+    "MetricsEngine",
     "RAGDocument",
     "MetricResult",
     "DimensionResult",

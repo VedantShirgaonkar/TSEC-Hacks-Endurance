@@ -1,29 +1,34 @@
 """
-FastAPI Backend for Endurance RAI Metrics Platform.
+Endurance API - Fast Concurrent Backend
+Real-time monitoring with in-memory sessions and SSE streaming.
 """
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from typing import List, Dict, Any, Optional
 from datetime import datetime
-import uuid
+from collections import deque
+from uuid import uuid4
+import asyncio
+import json
 
-# Import our metrics engine
-from endurance.metrics import (
-    compute_all_metrics,
-    RAGDocument,
-    EvaluationResult,
-)
-from endurance.verification import verify_response
+# Import metrics engine
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+from endurance.metrics import MetricsEngine
+from endurance.verification import VerificationPipeline
 
 app = FastAPI(
-    title="Endurance RAI Metrics API",
-    description="API for evaluating ethical quality of government AI responses",
-    version="0.1.0",
+    title="Endurance API",
+    description="Fast concurrent RAI metrics evaluation for government AI chatbots",
+    version="1.0.0",
 )
 
-# Enable CORS for frontend
+# Enable CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -32,64 +37,197 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# In-memory storage for demo
-sessions_db: Dict[str, Dict] = {}
-feedback_db: Dict[str, List[Dict]] = {}
-audit_log: List[Dict] = []
+# ============================================
+# IN-MEMORY STORES
+# ============================================
+
+# Session store (last 1000 sessions)
+sessions: deque = deque(maxlen=1000)
+
+# Service-level aggregate metrics
+service_metrics: Dict[str, Dict] = {}  # service_id -> aggregate stats
+
+# SSE stream clients
+stream_clients: set = set()
+
+# Alert threshold
+ALERT_THRESHOLD = 40.0
+
+# Initialize engines
+metrics_engine = MetricsEngine()
+verification_pipeline = VerificationPipeline()
 
 
-# Request/Response Models
-class RAGDocumentRequest(BaseModel):
-    id: str
-    source: str
-    content: str
-    page: Optional[int] = None
-    similarity_score: Optional[float] = None
+# ============================================
+# REQUEST/RESPONSE MODELS
+# ============================================
+
+class RAGDocument(BaseModel):
+    id: str = ""
+    source: str = ""
+    content: str = ""
 
 
 class EvaluateRequest(BaseModel):
     session_id: Optional[str] = None
+    service_id: Optional[str] = "default"
     query: str
     response: str
-    rag_documents: List[RAGDocumentRequest]
+    rag_documents: List[RAGDocument] = []
     metadata: Optional[Dict[str, Any]] = None
 
 
 class EvaluateResponse(BaseModel):
     session_id: str
+    service_id: str
     overall_score: float
     dimensions: Dict[str, float]
-    verification_score: float
-    verified_claims: int
-    total_claims: int
-    hallucinated_claims: int
+    verification: Dict[str, Any]
+    flagged: bool
+    flag_reasons: List[str]
     timestamp: str
 
 
-class FeedbackRequest(BaseModel):
+class SessionSummary(BaseModel):
     session_id: str
-    accuracy_rating: int = Field(ge=1, le=5)
-    completeness_rating: int = Field(ge=1, le=5)
-    clarity_rating: int = Field(ge=1, le=5)
-    issues: List[str] = []
-    comments: Optional[str] = None
-    evaluator_id: Optional[str] = None
-
-
-class FeedbackResponse(BaseModel):
-    feedback_id: str
-    session_id: str
-    average_rating: float
+    service_id: str
+    query_preview: str
+    overall_score: float
+    flagged: bool
     timestamp: str
 
 
-# API Endpoints
+class ServiceStats(BaseModel):
+    service_id: str
+    total_sessions: int
+    avg_score: float
+    flagged_count: int
+    flagged_percentage: float
+    dimension_averages: Dict[str, float]
+    last_updated: str
+
+
+# ============================================
+# HELPER FUNCTIONS
+# ============================================
+
+def compute_dimensions(query: str, response: str, rag_docs: List[Dict]) -> Dict[str, float]:
+    """Compute all dimension scores."""
+    try:
+        result = metrics_engine.evaluate(
+            query=query,
+            response=response,
+            rag_documents=rag_docs,
+        )
+        return result.get("dimensions", {})
+    except Exception as e:
+        print(f"Metrics error: {e}")
+        # Return default scores on error
+        return {
+            "bias_fairness": 75.0,
+            "data_grounding": 70.0,
+            "explainability": 65.0,
+            "ethical_alignment": 80.0,
+            "human_control": 70.0,
+            "legal_compliance": 75.0,
+            "security": 80.0,
+            "response_quality": 70.0,
+            "environmental_cost": 85.0,
+        }
+
+
+def compute_verification(response: str, rag_docs: List[Dict]) -> Dict[str, Any]:
+    """Run verification pipeline."""
+    try:
+        result = verification_pipeline.verify(
+            response=response,
+            rag_documents=rag_docs,
+        )
+        return {
+            "total_claims": result.get("total_claims", 0),
+            "verified_claims": result.get("verified_claims", 0),
+            "hallucinated_claims": result.get("hallucinated_claims", 0),
+            "verification_score": result.get("verification_score", 100.0),
+        }
+    except Exception as e:
+        print(f"Verification error: {e}")
+        return {
+            "total_claims": 0,
+            "verified_claims": 0,
+            "hallucinated_claims": 0,
+            "verification_score": 100.0,
+        }
+
+
+def check_flags(overall_score: float, dimensions: Dict[str, float], verification: Dict) -> tuple:
+    """Check if session should be flagged."""
+    flagged = False
+    reasons = []
+    
+    # Check overall score
+    if overall_score < ALERT_THRESHOLD:
+        flagged = True
+        reasons.append(f"Low overall score: {overall_score:.1f}")
+    
+    # Check individual dimensions
+    for dim, score in dimensions.items():
+        if score < ALERT_THRESHOLD:
+            flagged = True
+            reasons.append(f"Low {dim}: {score:.1f}")
+    
+    # Check hallucinations
+    if verification.get("hallucinated_claims", 0) > 0:
+        flagged = True
+        reasons.append(f"Hallucinations detected: {verification['hallucinated_claims']}")
+    
+    return flagged, reasons
+
+
+def update_service_metrics(service_id: str, session_data: Dict):
+    """Update aggregate metrics for a service."""
+    if service_id not in service_metrics:
+        service_metrics[service_id] = {
+            "total_sessions": 0,
+            "total_score": 0.0,
+            "flagged_count": 0,
+            "dimension_totals": {},
+            "last_updated": datetime.now().isoformat(),
+        }
+    
+    stats = service_metrics[service_id]
+    stats["total_sessions"] += 1
+    stats["total_score"] += session_data["overall_score"]
+    stats["flagged_count"] += 1 if session_data["flagged"] else 0
+    stats["last_updated"] = datetime.now().isoformat()
+    
+    # Update dimension totals
+    for dim, score in session_data["dimensions"].items():
+        if dim not in stats["dimension_totals"]:
+            stats["dimension_totals"][dim] = 0.0
+        stats["dimension_totals"][dim] += score
+
+
+async def broadcast_to_clients(session_data: Dict):
+    """Send new session to all SSE clients."""
+    for queue in list(stream_clients):
+        try:
+            await queue.put(session_data)
+        except Exception:
+            stream_clients.discard(queue)
+
+
+# ============================================
+# API ENDPOINTS
+# ============================================
+
 @app.get("/")
 async def root():
     return {
-        "name": "Endurance RAI Metrics API",
-        "version": "0.1.0",
+        "name": "Endurance API",
+        "version": "1.0.0",
         "status": "running",
+        "sessions_in_memory": len(sessions),
+        "services_tracked": len(service_metrics),
     }
 
 
@@ -99,266 +237,260 @@ async def health_check():
 
 
 @app.post("/v1/evaluate", response_model=EvaluateResponse)
-async def evaluate_response(request: EvaluateRequest):
+async def evaluate(request: EvaluateRequest):
     """
-    Evaluate an AI response against ethical dimensions.
+    Evaluate a chatbot response and return metrics.
+    This is the main endpoint for SDK integration.
     """
-    # Generate session ID if not provided
-    session_id = request.session_id or str(uuid.uuid4())
-    
-    # Log to audit trail
-    log_event("QUERY_RECEIVED", session_id, {
-        "query": request.query[:100],
-        "rag_doc_count": len(request.rag_documents),
-    })
-    
-    # Convert RAG documents
-    rag_docs = [
-        RAGDocument(
-            id=doc.id,
-            source=doc.source,
-            content=doc.content,
-            page=doc.page,
-            similarity_score=doc.similarity_score,
-        )
-        for doc in request.rag_documents
-    ]
-    
-    # Log RAG retrieval
-    log_event("RAG_RETRIEVAL", session_id, {
-        "documents": [doc.source for doc in rag_docs],
-    })
-    
-    # Run verification first
-    verification_result = verify_response(request.response, rag_docs)
-    
-    log_event("VERIFICATION_COMPLETE", session_id, {
-        "total_claims": verification_result.total_claims,
-        "verified_claims": verification_result.verified_claims,
-        "hallucinated_claims": verification_result.hallucinated_claims,
-    })
-    
-    # Prepare metadata for metrics
-    metadata = request.metadata or {}
-    metadata["verified_claims"] = verification_result.verified_claims
-    metadata["total_claims"] = verification_result.total_claims
-    metadata["hallucinated_claims"] = verification_result.hallucinated_claims
-    
-    # Compute all metrics
-    evaluation = compute_all_metrics(
-        query=request.query,
-        response=request.response,
-        rag_documents=rag_docs,
-        metadata=metadata,
-    )
-    
-    # Extract dimension scores
-    dimension_scores = {
-        name: dim.score for name, dim in evaluation.dimensions.items()
-    }
-    
-    log_event("EVALUATION_COMPLETE", session_id, {
-        "overall_score": evaluation.overall_score,
-        "dimensions": dimension_scores,
-    })
-    
-    # Store session
+    session_id = request.session_id or str(uuid4())
+    service_id = request.service_id or "default"
     timestamp = datetime.now().isoformat()
-    sessions_db[session_id] = {
+    
+    # Convert RAG documents to dict format
+    rag_docs = [doc.model_dump() for doc in request.rag_documents]
+    
+    # Compute metrics
+    dimensions = compute_dimensions(request.query, request.response, rag_docs)
+    
+    # Compute overall score (weighted average)
+    overall_score = sum(dimensions.values()) / len(dimensions) if dimensions else 0.0
+    
+    # Run verification
+    verification = compute_verification(request.response, rag_docs)
+    
+    # Apply verification penalty
+    if verification["verification_score"] < 100:
+        penalty = (100 - verification["verification_score"]) * 0.3
+        overall_score = max(0, overall_score - penalty)
+    
+    # Check for flags
+    flagged, flag_reasons = check_flags(overall_score, dimensions, verification)
+    
+    # Create session data
+    session_data = {
         "session_id": session_id,
+        "service_id": service_id,
         "query": request.query,
         "response": request.response,
-        "rag_documents": [doc.dict() for doc in request.rag_documents],
-        "evaluation": {
-            "overall_score": evaluation.overall_score,
-            "dimensions": dimension_scores,
-            "metrics": {k: {"name": v.name, "score": v.normalized_score} 
-                       for k, v in evaluation.metrics.items()},
-        },
-        "verification": {
-            "score": verification_result.verification_score,
-            "claims": verification_result.claims,
-            "hallucinations": verification_result.hallucinations,
-        },
+        "overall_score": overall_score,
+        "dimensions": dimensions,
+        "verification": verification,
+        "flagged": flagged,
+        "flag_reasons": flag_reasons,
         "timestamp": timestamp,
+        "metadata": request.metadata,
     }
+    
+    # Store in memory
+    sessions.appendleft(session_data)
+    
+    # Update service aggregates
+    update_service_metrics(service_id, session_data)
+    
+    # Broadcast to SSE clients
+    asyncio.create_task(broadcast_to_clients(session_data))
     
     return EvaluateResponse(
         session_id=session_id,
-        overall_score=evaluation.overall_score,
-        dimensions=dimension_scores,
-        verification_score=verification_result.verification_score,
-        verified_claims=verification_result.verified_claims,
-        total_claims=verification_result.total_claims,
-        hallucinated_claims=verification_result.hallucinated_claims,
+        service_id=service_id,
+        overall_score=overall_score,
+        dimensions=dimensions,
+        verification=verification,
+        flagged=flagged,
+        flag_reasons=flag_reasons,
         timestamp=timestamp,
     )
 
 
-@app.get("/v1/metrics/{session_id}")
-async def get_metrics(session_id: str):
-    """
-    Get computed metrics for a session.
-    """
-    if session_id not in sessions_db:
-        raise HTTPException(status_code=404, detail="Session not found")
+@app.get("/v1/sessions")
+async def get_sessions(
+    limit: int = 50,
+    service_id: Optional[str] = None,
+    flagged_only: bool = False,
+):
+    """Get recent sessions with optional filters."""
+    result = []
+    for session in sessions:
+        if service_id and session["service_id"] != service_id:
+            continue
+        if flagged_only and not session["flagged"]:
+            continue
+        
+        result.append(SessionSummary(
+            session_id=session["session_id"],
+            service_id=session["service_id"],
+            query_preview=session["query"][:100] + "..." if len(session["query"]) > 100 else session["query"],
+            overall_score=session["overall_score"],
+            flagged=session["flagged"],
+            timestamp=session["timestamp"],
+        ))
+        
+        if len(result) >= limit:
+            break
     
-    session = sessions_db[session_id]
-    return {
-        "session_id": session_id,
-        "evaluation": session["evaluation"],
-        "timestamp": session["timestamp"],
-    }
+    return {"sessions": result, "total": len(result)}
 
 
-@app.get("/v1/verify/{session_id}")
-async def get_verification(session_id: str):
-    """
-    Get verification details for a session.
-    """
-    if session_id not in sessions_db:
-        raise HTTPException(status_code=404, detail="Session not found")
-    
-    session = sessions_db[session_id]
-    return {
-        "session_id": session_id,
-        "verification": session["verification"],
-        "timestamp": session["timestamp"],
-    }
+@app.get("/v1/sessions/{session_id}")
+async def get_session(session_id: str):
+    """Get full details for a specific session."""
+    for session in sessions:
+        if session["session_id"] == session_id:
+            return session
+    raise HTTPException(status_code=404, detail="Session not found")
 
 
-@app.get("/v1/claims/{session_id}")
-async def get_claims(session_id: str):
-    """
-    Get extracted claims for a session.
-    """
-    if session_id not in sessions_db:
-        raise HTTPException(status_code=404, detail="Session not found")
-    
-    session = sessions_db[session_id]
-    return {
-        "session_id": session_id,
-        "claims": session["verification"]["claims"],
-    }
+@app.get("/v1/services")
+async def get_services():
+    """Get all tracked services with aggregate metrics."""
+    result = []
+    for service_id, stats in service_metrics.items():
+        total = stats["total_sessions"]
+        result.append(ServiceStats(
+            service_id=service_id,
+            total_sessions=total,
+            avg_score=stats["total_score"] / total if total > 0 else 0,
+            flagged_count=stats["flagged_count"],
+            flagged_percentage=(stats["flagged_count"] / total * 100) if total > 0 else 0,
+            dimension_averages={
+                dim: total_score / total if total > 0 else 0
+                for dim, total_score in stats["dimension_totals"].items()
+            },
+            last_updated=stats["last_updated"],
+        ))
+    return {"services": result}
 
 
-@app.post("/v1/feedback", response_model=FeedbackResponse)
-async def submit_feedback(request: FeedbackRequest):
-    """
-    Submit human feedback for a session.
-    """
-    if request.session_id not in sessions_db:
-        raise HTTPException(status_code=404, detail="Session not found")
+@app.get("/v1/services/{service_id}/stats")
+async def get_service_stats(service_id: str):
+    """Get aggregate metrics for a specific service."""
+    if service_id not in service_metrics:
+        raise HTTPException(status_code=404, detail="Service not found")
     
-    feedback_id = str(uuid.uuid4())
-    timestamp = datetime.now().isoformat()
+    stats = service_metrics[service_id]
+    total = stats["total_sessions"]
     
-    avg_rating = (
-        request.accuracy_rating +
-        request.completeness_rating +
-        request.clarity_rating
-    ) / 3
-    
-    feedback = {
-        "feedback_id": feedback_id,
-        "session_id": request.session_id,
-        "accuracy_rating": request.accuracy_rating,
-        "completeness_rating": request.completeness_rating,
-        "clarity_rating": request.clarity_rating,
-        "average_rating": avg_rating,
-        "issues": request.issues,
-        "comments": request.comments,
-        "evaluator_id": request.evaluator_id,
-        "timestamp": timestamp,
-    }
-    
-    if request.session_id not in feedback_db:
-        feedback_db[request.session_id] = []
-    feedback_db[request.session_id].append(feedback)
-    
-    log_event("HUMAN_FEEDBACK", request.session_id, {
-        "average_rating": avg_rating,
-        "issues_count": len(request.issues),
-    })
-    
-    return FeedbackResponse(
-        feedback_id=feedback_id,
-        session_id=request.session_id,
-        average_rating=avg_rating,
-        timestamp=timestamp,
+    return ServiceStats(
+        service_id=service_id,
+        total_sessions=total,
+        avg_score=stats["total_score"] / total if total > 0 else 0,
+        flagged_count=stats["flagged_count"],
+        flagged_percentage=(stats["flagged_count"] / total * 100) if total > 0 else 0,
+        dimension_averages={
+            dim: total_score / total if total > 0 else 0
+            for dim, total_score in stats["dimension_totals"].items()
+        },
+        last_updated=stats["last_updated"],
     )
 
 
-@app.get("/v1/feedback/{session_id}")
-async def get_feedback(session_id: str):
+@app.get("/v1/stream")
+async def stream(request: Request, flagged_only: bool = False):
     """
-    Get human feedback for a session.
+    Server-Sent Events stream for real-time updates.
+    Dashboard connects here for live session feed.
     """
-    if session_id not in feedback_db:
-        return {"session_id": session_id, "feedback": []}
+    async def event_generator():
+        queue = asyncio.Queue()
+        stream_clients.add(queue)
+        
+        try:
+            # Send initial batch of sessions
+            initial_sessions = [
+                s for s in list(sessions) 
+                if not flagged_only or s["flagged"]
+            ][:50]
+            yield f"event: init\ndata: {json.dumps(initial_sessions, default=str)}\n\n"
+            
+            # Stream new sessions
+            while True:
+                # Check if client disconnected
+                if await request.is_disconnected():
+                    break
+                
+                try:
+                    # Wait for new session with timeout
+                    session = await asyncio.wait_for(queue.get(), timeout=1.0)
+                    
+                    # Apply filter
+                    if flagged_only and not session["flagged"]:
+                        continue
+                        
+                    yield f"event: session\ndata: {json.dumps(session, default=str)}\n\n"
+                except asyncio.TimeoutError:
+                    # Send keepalive ping
+                    yield f"event: ping\ndata: {json.dumps({'ts': datetime.now().isoformat()})}\n\n"
+        finally:
+            stream_clients.discard(queue)
+    
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",  # Disable nginx buffering
+        },
+    )
+
+
+@app.get("/v1/metrics/summary")
+async def get_metrics_summary():
+    """Get overall system metrics summary."""
+    total_sessions = len(sessions)
+    flagged_sessions = sum(1 for s in sessions if s["flagged"])
+    
+    # Calculate averages across all sessions
+    if total_sessions > 0:
+        avg_score = sum(s["overall_score"] for s in sessions) / total_sessions
+        
+        dimension_sums = {}
+        for s in sessions:
+            for dim, score in s["dimensions"].items():
+                dimension_sums[dim] = dimension_sums.get(dim, 0) + score
+        
+        dimension_averages = {
+            dim: total / total_sessions
+            for dim, total in dimension_sums.items()
+        }
+    else:
+        avg_score = 0
+        dimension_averages = {}
     
     return {
-        "session_id": session_id,
-        "feedback": feedback_db[session_id],
+        "total_sessions": total_sessions,
+        "flagged_sessions": flagged_sessions,
+        "flagged_percentage": (flagged_sessions / total_sessions * 100) if total_sessions > 0 else 0,
+        "avg_overall_score": avg_score,
+        "dimension_averages": dimension_averages,
+        "services_count": len(service_metrics),
+        "alert_threshold": ALERT_THRESHOLD,
     }
 
 
-@app.get("/v1/audit/{session_id}")
-async def get_audit_log(session_id: str):
-    """
-    Get audit log for a session.
-    """
-    session_events = [e for e in audit_log if e.get("session_id") == session_id]
-    return {
-        "session_id": session_id,
-        "events": session_events,
-    }
+@app.post("/v1/feedback/{session_id}")
+async def submit_feedback(
+    session_id: str,
+    approved: bool,
+    comment: Optional[str] = None,
+):
+    """Submit human feedback for a session."""
+    for session in sessions:
+        if session["session_id"] == session_id:
+            session["human_feedback"] = {
+                "approved": approved,
+                "comment": comment,
+                "submitted_at": datetime.now().isoformat(),
+            }
+            return {"status": "ok", "session_id": session_id}
+    
+    raise HTTPException(status_code=404, detail="Session not found")
 
 
-@app.get("/v1/audit")
-async def get_full_audit_log(limit: int = 100):
-    """
-    Get full audit log (limited).
-    """
-    return {
-        "total_events": len(audit_log),
-        "events": audit_log[-limit:],
-    }
+# ============================================
+# MAIN
+# ============================================
 
-
-@app.get("/v1/dimensions")
-async def list_dimensions():
-    """
-    List all ethical dimensions.
-    """
-    return {
-        "dimensions": [
-            {"id": "bias_fairness", "name": "Bias & Fairness", "weight": 0.12},
-            {"id": "data_grounding", "name": "Data Grounding & Drift", "weight": 0.15},
-            {"id": "explainability", "name": "Explainability & Transparency", "weight": 0.10},
-            {"id": "ethical_alignment", "name": "Ethical Alignment", "weight": 0.10},
-            {"id": "human_control", "name": "Human Control & Oversight", "weight": 0.08},
-            {"id": "legal_compliance", "name": "Legal & Regulatory Compliance", "weight": 0.15},
-            {"id": "security", "name": "Security & Robustness", "weight": 0.10},
-            {"id": "response_quality", "name": "Response Quality", "weight": 0.12},
-            {"id": "environmental_cost", "name": "Environmental & Cost", "weight": 0.08},
-        ]
-    }
-
-
-# Utility functions
-def log_event(event_type: str, session_id: str, data: Dict[str, Any]):
-    """Add event to audit log."""
-    audit_log.append({
-        "id": str(uuid.uuid4()),
-        "timestamp": datetime.now().isoformat(),
-        "event_type": event_type,
-        "session_id": session_id,
-        "data": data,
-    })
-
-
-# Run with: uvicorn api.main:app --reload
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)

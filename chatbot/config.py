@@ -31,7 +31,7 @@ if ENV == "local":
     VECTOR_STORE_TYPE = "chromadb"
     DOCS_PATH = CHATBOT_DIR / "rag_docs"
     VECTOR_STORE_PATH = CHATBOT_DIR / "vector_store"
-    ENDURANCE_URL = "http://localhost:8000"
+    ENDURANCE_URL = "http://localhost:8002"
 else:
     # AWS configuration (for future use)
     VECTOR_STORE_TYPE = "faiss_s3"
