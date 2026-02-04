@@ -21,6 +21,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from endurance.metrics import MetricsEngine
 from endurance.verification import VerificationPipeline
+from endurance.storage import get_mongo_engine
 
 app = FastAPI(
     title="Endurance API",
@@ -38,14 +39,14 @@ app.add_middleware(
 )
 
 # ============================================
-# IN-MEMORY STORES
+# STORAGE
 # ============================================
 
-# Session store (last 1000 sessions)
-sessions: deque = deque(maxlen=1000)
+# MongoDB for persistent storage
+mongo = get_mongo_engine()
 
-# Service-level aggregate metrics
-service_metrics: Dict[str, Dict] = {}  # service_id -> aggregate stats
+# In-memory cache for fast access (last 100 sessions)
+sessions: deque = deque(maxlen=100)
 
 # SSE stream clients
 stream_clients: set = set()
@@ -186,27 +187,8 @@ def check_flags(overall_score: float, dimensions: Dict[str, float], verification
 
 
 def update_service_metrics(service_id: str, session_data: Dict):
-    """Update aggregate metrics for a service."""
-    if service_id not in service_metrics:
-        service_metrics[service_id] = {
-            "total_sessions": 0,
-            "total_score": 0.0,
-            "flagged_count": 0,
-            "dimension_totals": {},
-            "last_updated": datetime.now().isoformat(),
-        }
-    
-    stats = service_metrics[service_id]
-    stats["total_sessions"] += 1
-    stats["total_score"] += session_data["overall_score"]
-    stats["flagged_count"] += 1 if session_data["flagged"] else 0
-    stats["last_updated"] = datetime.now().isoformat()
-    
-    # Update dimension totals
-    for dim, score in session_data["dimensions"].items():
-        if dim not in stats["dimension_totals"]:
-            stats["dimension_totals"][dim] = 0.0
-        stats["dimension_totals"][dim] += score
+    """Update aggregate metrics for a service in MongoDB."""
+    mongo.update_service_stats(service_id, session_data)
 
 
 async def broadcast_to_clients(session_data: Dict):
@@ -229,7 +211,8 @@ async def root():
         "version": "1.0.0",
         "status": "running",
         "sessions_in_memory": len(sessions),
-        "services_tracked": len(service_metrics),
+        "mongodb_connected": mongo.connected,
+        "services_tracked": len(mongo.get_all_services()) if mongo.connected else 0,
     }
 
 
@@ -248,107 +231,77 @@ async def evaluate(request: EvaluateRequest):
     session_id = request.session_id or str(uuid4())
     service_id = request.service_id or "default"
     
-    # 2. Log Query
-    log_event("QUERY_RECEIVED", session_id, {
-        "query": request.query[:100],
-        "rag_doc_count": len(request.rag_documents),
-    })
+    # 2. Convert RAG documents to dict format
+    rag_docs= [{
+        "id": doc.id or "",
+        "source": doc.source or "",
+        "content": doc.content or "",
+        "page": getattr(doc, 'page', 0),
+        "similarity_score": getattr(doc, 'similarity_score', 0.0)
+    } for doc in request.rag_documents]
     
-    # 3. Convert RAG Documents
-    rag_docs = [
-        RAGDocument(
-            id=doc.id,
-            source=doc.source,
-            content=doc.content,
-            page=doc.page,
-            similarity_score=doc.similarity_score,
-        )
-        for doc in request.rag_documents
-    ]
+    # 3. Compute dimensions
+    dimensions = compute_dimensions(request.query, request.response, rag_docs)
     
-    # 4. Log RAG Retrieval
-    log_event("RAG_RETRIEVAL", session_id, {
-        "documents": [doc.source for doc in rag_docs],
-    })
+    # 4. Compute verification
+    verification = compute_verification(request.response, rag_docs)
     
-    # 5. Verification (Robust)
-    verification_result = verify_response(request.response, rag_docs)
+    # 5. Calculate overall score
+    if request.custom_weights:
+        weights = request.custom_weights
+    else:
+        weights = {dim: 1.0 for dim in dimensions.keys()}
     
-    log_event("VERIFICATION_COMPLETE", session_id, {
-        "total_claims": verification_result.total_claims,
-        "verified_claims": verification_result.verified_claims,
-        "hallucinated_claims": verification_result.hallucinated_claims,
-    })
+    total_weight = sum(weights.values())
+    overall_score = sum(
+        dimensions[dim] * weights.get(dim, 1.0) 
+        for dim in dimensions.keys()
+    ) / total_weight if total_weight > 0 else 0.0
     
-    # 6. Metadata
-    metadata = request.metadata or {}
-    metadata["verified_claims"] = verification_result.verified_claims
-    metadata["total_claims"] = verification_result.total_claims
-    metadata["hallucinated_claims"] = verification_result.hallucinated_claims
+    # 6. Check flags
+    flagged, flag_reasons = check_flags(overall_score, dimensions, verification)
     
-    # 7. Compute Metrics (Robust with Reasoning)
-    evaluation = compute_all_metrics(
-        query=request.query,
-        response=request.response,
-        rag_documents=rag_docs,
-        metadata=metadata,
-        weights=request.custom_weights,
-    )
-    
-    # 8. Extract Dimensions
-    dimension_scores = {
-        name: dim.score for name, dim in evaluation.dimensions.items()
-    }
-    
-    # 9. Log Evaluation
-    log_event("EVALUATION_COMPLETE", session_id, {
-        "overall_score": evaluation.overall_score,
-        "dimensions": dimension_scores,
-    })
-    
-    # 10. Check Flags
-    # Create verification dict for check_flags
-    verification_dict = {
-        "total_claims": verification_result.total_claims,
-        "verified_claims": verification_result.verified_claims,
-        "hallucinated_claims": verification_result.hallucinated_claims,
-        "verification_score": verification_result.score
-    }
-    
-    flagged, flag_reasons = check_flags(evaluation.overall_score, dimension_scores, verification_dict)
-    
-    # 11. Store Session
+    # 7. Store Session
     timestamp = datetime.now().isoformat()
     session_data = {
         "session_id": session_id,
         "service_id": service_id,
         "query": request.query,
         "response": request.response,
-        "overall_score": evaluation.overall_score,
-        "dimensions": dimension_scores,
-        "verification": verification_dict,
+        "overall_score": overall_score,
+        "dimensions": dimensions,
+        "verification": verification,
         "flagged": flagged,
         "flag_reasons": flag_reasons,
         "timestamp": timestamp,
-        "metadata": request.metadata,
-        "reasoning": evaluation.reasoning,
+        "metadata": request.metadata or {},
     }
     
+    
+    # Store in memory cache (fast access)
     sessions.appendleft(session_data)
+    
+    # Store in MongoDB (persistent) - async fire-and-forget
+    if mongo.connected:
+        asyncio.create_task(asyncio.to_thread(mongo.insert_session, session_data))
+    
+    # Update service metrics in MongoDB
     update_service_metrics(service_id, session_data)
+    
+    # Broadcast to SSE clients
     asyncio.create_task(broadcast_to_clients(session_data))
     
-    # 12. Return Response
+    # 8. Return Response
     return EvaluateResponse(
         session_id=session_id,
         service_id=service_id,
-        overall_score=evaluation.overall_score,
-        dimensions=dimension_scores,
-        verification=verification_dict,
+        overall_score=overall_score,
+        dimensions=dimensions,
+        verification=verification,
         flagged=flagged,
         flag_reasons=flag_reasons,
         timestamp=timestamp,
-        reasoning=evaluation.reasoning,
+        reasoning=None,
     )
 
 
@@ -358,7 +311,15 @@ async def get_sessions(
     service_id: Optional[str] = None,
     flagged_only: bool = False,
 ):
-    """Get recent sessions with optional filters."""
+    """Get recent sessions with optional filters from MongoDB."""
+    # Try MongoDB first
+    if mongo.connected:
+        db_sessions = await asyncio.to_thread(
+            mongo.get_sessions, limit, service_id, flagged_only
+        )
+        return {"sessions": db_sessions, "total": len(db_sessions), "source": "mongodb"}
+    
+    # Fallback to memory cache
     result = []
     for session in sessions:
         if service_id and session["service_id"] != service_id:
@@ -378,12 +339,19 @@ async def get_sessions(
         if len(result) >= limit:
             break
     
-    return {"sessions": result, "total": len(result)}
+    return {"sessions": result, "total": len(result), "source": "memory"}
 
 
 @app.get("/v1/sessions/{session_id}")
 async def get_session(session_id: str):
     """Get full details for a specific session."""
+    # Try MongoDB first
+    if mongo.connected:
+        doc = await asyncio.to_thread(mongo.get_session_by_id, session_id)
+        if doc:
+            return doc
+    
+    # Fallback to memory cache
     for session in sessions:
         if session["session_id"] == session_id:
             return session
@@ -392,45 +360,29 @@ async def get_session(session_id: str):
 
 @app.get("/v1/services")
 async def get_services():
-    """Get all tracked services with aggregate metrics."""
-    result = []
-    for service_id, stats in service_metrics.items():
-        total = stats["total_sessions"]
-        result.append(ServiceStats(
-            service_id=service_id,
-            total_sessions=total,
-            avg_score=stats["total_score"] / total if total > 0 else 0,
-            flagged_count=stats["flagged_count"],
-            flagged_percentage=(stats["flagged_count"] / total * 100) if total > 0 else 0,
-            dimension_averages={
-                dim: total_score / total if total > 0 else 0
-                for dim, total_score in stats["dimension_totals"].items()
-            },
-            last_updated=stats["last_updated"],
-        ))
-    return {"services": result}
+    """Get all tracked services with aggregate metrics from MongoDB."""
+    if mongo.connected:
+        services = await asyncio.to_thread(mongo.get_all_services)
+        return {"services": services, "source": "mongodb"}
+    return {"services": [], "source": "memory"}
 
 
 @app.get("/v1/services/{service_id}/stats")
 async def get_service_stats(service_id: str):
-    """Get aggregate metrics for a specific service."""
-    if service_id not in service_metrics:
-        raise HTTPException(status_code=404, detail="Service not found")
+    """Get aggregate metrics for a specific service from MongoDB."""
+    if not mongo.connected:
+        raise HTTPException(
+            status_code=503, 
+            detail="MongoDB disconnected - service stats unavailable"
+        )
     
-    stats = service_metrics[service_id]
-    total = stats["total_sessions"]
+    stats = await asyncio.to_thread(mongo.get_service_stats, service_id)
+    if stats:
+        return stats
     
-    return ServiceStats(
-        service_id=service_id,
-        total_sessions=total,
-        avg_score=stats["total_score"] / total if total > 0 else 0,
-        flagged_count=stats["flagged_count"],
-        flagged_percentage=(stats["flagged_count"] / total * 100) if total > 0 else 0,
-        dimension_averages={
-            dim: total_score / total if total > 0 else 0
-            for dim, total_score in stats["dimension_totals"].items()
-        },
-        last_updated=stats["last_updated"],
+    raise HTTPException(
+        status_code=404, 
+        detail=f"Service '{service_id}' not found. No sessions recorded for this service."
     )
 
 
@@ -486,35 +438,24 @@ async def stream(request: Request, flagged_only: bool = False):
 
 @app.get("/v1/metrics/summary")
 async def get_metrics_summary():
-    """Get overall system metrics summary."""
+    """Get overall system metrics summary from MongoDB."""
+    if mongo.connected:
+        summary = await asyncio.to_thread(mongo.get_metrics_summary)
+        summary["alert_threshold"] = ALERT_THRESHOLD
+        return summary
+    
+    # Fallback to memory cache
     total_sessions = len(sessions)
     flagged_sessions = sum(1 for s in sessions if s["flagged"])
-    
-    # Calculate averages across all sessions
-    if total_sessions > 0:
-        avg_score = sum(s["overall_score"] for s in sessions) / total_sessions
-        
-        dimension_sums = {}
-        for s in sessions:
-            for dim, score in s["dimensions"].items():
-                dimension_sums[dim] = dimension_sums.get(dim, 0) + score
-        
-        dimension_averages = {
-            dim: total / total_sessions
-            for dim, total in dimension_sums.items()
-        }
-    else:
-        avg_score = 0
-        dimension_averages = {}
     
     return {
         "total_sessions": total_sessions,
         "flagged_sessions": flagged_sessions,
         "flagged_percentage": (flagged_sessions / total_sessions * 100) if total_sessions > 0 else 0,
-        "avg_overall_score": avg_score,
-        "dimension_averages": dimension_averages,
-        "services_count": len(service_metrics),
+        "services_count": 0,
         "alert_threshold": ALERT_THRESHOLD,
+        "connected": False,
+        "source": "memory"
     }
 
 
