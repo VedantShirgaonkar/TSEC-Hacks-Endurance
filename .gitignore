@@ -1,0 +1,121 @@
+# Python
+*.py[cod]
+*$py.class
+__pycache__/
+*.so
+.Python
+*.egg-info/
+dist/
+build/
+*.egg
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Virtual Environments
+venv/
+env/
+ENV/
+.venv
+lambda-chatbot/venv/
+lambda-slim/venv/
+
+# Environment Variables & Secrets (CRITICAL - DO NOT COMMIT)
+.env
+env
+*.env
+.env.local
+.env.production
+
+# AWS Configuration & Deployment Files (CRITICAL - CONTAINS IDENTIFIERS)
+.aws-buckets.txt
+.api-gateway.txt
+trust-policy.json
+lambda-permissions.json
+.aws/
+
+# Lambda Deployment Artifacts
+lambda-chatbot/
+lambda-slim/
+lambda-layer/
+*.zip
+function*.zip
+chatbot-*.zip
+
+# ChromaDB Vector Store
+vector_store/
+chroma.sqlite3
+*.sqlite3
+
+# IDE & Editor Files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+*.sublime-project
+*.sublime-workspace
+
+# macOS System Files
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# Logs
+*.log
+logs/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.hypothesis/
+*.cover
+.cache
+nosetests.xml
+coverage.xml
+
+# Documentation Builds
+docs/_build/
+site/
+_site/
+
+# Jupyter Notebook
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+
+# Temporary Files
+*.tmp
+*.bak
+*.swp
+.cache/
+tmp/
+temp/
+
+# Node.js (if frontend exists)
+node_modules/
+package-lock.json
+yarn.lock
+
+# Build Output
+dist/
+build/
+*.egg-info/
+
+# Database
+*.db
+*.sqlite
+
+# Backup Files
+*.backup
+*~
+
+# OS Generated
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
