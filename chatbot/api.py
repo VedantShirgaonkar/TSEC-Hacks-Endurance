@@ -9,14 +9,35 @@ from typing import List, Dict, Any, Optional
 from datetime import datetime
 import httpx
 
-from chatbot.chain import get_rag_chain
+import os
+
+# Use S3-based chain in AWS environment, local ChromaDB otherwise
+if os.getenv("ENDURANCE_ENV", "local") == "aws":
+    from chatbot.chain_s3 import get_rag_chain
+else:
+    from chatbot.chain import get_rag_chain
+
 from chatbot.config import ENDURANCE_URL
 
-app = FastAPI(
-    title="RTI Assistant Chatbot",
-    description="LangChain RAG chatbot for RTI queries with Endurance monitoring",
-    version="0.1.0",
-)
+# Configure API paths based on environment
+# In AWS Lambda with API Gateway, paths need the stage prefix
+if os.getenv("ENDURANCE_ENV", "local") == "aws":
+    # API Gateway stage prefix
+    ROOT_PATH = "/prod"
+    app = FastAPI(
+        title="RTI Assistant Chatbot",
+        description="LangChain RAG chatbot for RTI queries with Endurance monitoring",
+        version="0.1.0",
+        root_path=ROOT_PATH,
+        openapi_url="/openapi.json",
+        docs_url="/docs",
+    )
+else:
+    app = FastAPI(
+        title="RTI Assistant Chatbot",
+        description="LangChain RAG chatbot for RTI queries with Endurance monitoring",
+        version="0.1.0",
+    )
 
 # Enable CORS
 app.add_middleware(
