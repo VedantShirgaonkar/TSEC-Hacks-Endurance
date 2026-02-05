@@ -17,7 +17,8 @@ if os.getenv("ENDURANCE_ENV", "local") == "aws":
 else:
     from chatbot.chain import get_rag_chain
 
-from chatbot.config import ENDURANCE_URL
+# Endurance telemetry URL (HuggingFace Space)
+ENDURANCE_URL = os.getenv("ENDURANCE_URL", "https://lamaq-endurance-backend-4-hods.hf.space")
 
 # Configure API paths based on environment
 # In AWS Lambda with API Gateway, paths need the stage prefix
@@ -88,9 +89,10 @@ async def health_check():
 async def chat(request: ChatRequest):
     """
     Send a message to the chatbot and get a response.
-    Optionally includes Endurance evaluation.
+    Optionally sends telemetry to Endurance (fire-and-forget).
     """
     import uuid
+    import asyncio
     
     session_id = request.session_id or str(uuid.uuid4())
     timestamp = datetime.now().isoformat()
@@ -112,10 +114,10 @@ async def chat(request: ChatRequest):
             for doc in rag_documents
         ]
         
-        # Run Endurance evaluation if requested
-        evaluation = None
+        # Send to Endurance (await to ensure it completes before Lambda exits)
+        evaluation_result = None
         if request.include_evaluation:
-            evaluation = await evaluate_response(
+            evaluation_result = await send_to_endurance(
                 session_id=session_id,
                 query=request.message,
                 response=response_text,
@@ -127,7 +129,7 @@ async def chat(request: ChatRequest):
             message=request.message,
             response=response_text,
             sources=sources,
-            evaluation=evaluation,
+            evaluation=evaluation_result,
             timestamp=timestamp,
         )
         
@@ -135,36 +137,45 @@ async def chat(request: ChatRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-async def evaluate_response(
+async def send_to_endurance(
     session_id: str,
     query: str,
     response: str,
     rag_documents: List[Dict[str, Any]],
 ) -> Dict[str, Any]:
     """
-    Call Endurance API to evaluate the response.
+    Send telemetry to Endurance API and return evaluation result.
+    Errors are logged but don't crash the chatbot.
     """
     try:
-        async with httpx.AsyncClient(timeout=30.0) as client:
+        async with httpx.AsyncClient(timeout=10.0) as client:
             eval_response = await client.post(
                 f"{ENDURANCE_URL}/v1/evaluate",
                 json={
                     "session_id": session_id,
                     "query": query,
                     "response": response,
-                    "rag_documents": rag_documents,
+                    "service_id": "rti_chatbot",
+                    "rag_documents": [
+                        {
+                            "source": doc.get("source", "unknown"),
+                            "content": doc.get("content", ""),
+                            "id": doc.get("id", ""),
+                            "similarity_score": doc.get("similarity_score", 0.0)
+                        }
+                        for doc in rag_documents
+                    ],
                 },
             )
-            
             if eval_response.status_code == 200:
                 return eval_response.json()
             else:
-                print(f"Endurance evaluation failed: {eval_response.status_code}")
-                return None
-                
+                print(f"Endurance API error: {eval_response.status_code}")
+                return {"status": "error", "code": eval_response.status_code}
     except Exception as e:
-        print(f"Endurance evaluation error: {e}")
-        return None
+        # Don't let Endurance errors crash chatbot
+        print(f"Endurance telemetry error (non-critical): {e}")
+        return {"status": "error", "message": str(e)}
 
 
 # Run with: uvicorn chatbot.api:app --port 8001 --reload
