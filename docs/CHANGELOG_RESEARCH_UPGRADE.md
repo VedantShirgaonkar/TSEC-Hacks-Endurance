@@ -136,7 +136,41 @@ Model-agnostic certification with:
 
 ---
 
-## Metrics Summary
+## API Integration
+
+### `api/main.py`
+
+**Changes:** +50 lines | Compliance mode & preset support
+
+| Feature | Endpoint/Parameter |
+|---------|-------------------|
+| `compliance_mode` param | `POST /v1/evaluate` → accepts `"RTI"`, `"UK_GDPR"`, `"EU_AI_ACT"` |
+| `preset` param | `POST /v1/evaluate` → accepts preset key (e.g., `"uk_govt_standard"`) |
+| `GET /v1/presets` | New endpoint - list all available presets |
+| `GET /v1/compliance-modes` | New endpoint - list valid compliance modes |
+
+**Example Request:**
+```json
+POST /v1/evaluate
+{
+  "query": "What is the budget?",
+  "response": "The budget is £50 million.",
+  "preset": "uk_govt_standard"
+}
+```
+→ Automatically uses UK_GDPR compliance mode and UK-weighted scoring.
+
+### `endurance/metrics/__init__.py`
+
+**Changes:** +10 lines | Pass-through compliance mode
+
+| Function | Change |
+|----------|--------|
+| `compute_all_metrics()` | Added `compliance_mode` parameter |
+| `MetricsEngine.evaluate()` | Added `compliance_mode` parameter |
+| Legal compliance call | Now passes `compliance_mode` to `legal_compliance.compute()` |
+
+---
 
 | Before | After |
 |--------|-------|

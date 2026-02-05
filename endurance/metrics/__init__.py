@@ -92,6 +92,7 @@ def compute_all_metrics(
     rag_documents: List[RAGDocument],
     metadata: Optional[Dict[str, Any]] = None,
     weights: Optional[Dict[str, float]] = None,
+    compliance_mode: str = "RTI",
 ) -> EvaluationResult:
     """
     Compute all metrics across 9 ethical dimensions.
@@ -102,6 +103,7 @@ def compute_all_metrics(
         rag_documents: Documents retrieved by RAG
         metadata: Optional metadata (tokens, latency, model, etc.)
         weights: Optional custom dimension weights
+        compliance_mode: "RTI" (India), "UK_GDPR", or "EU_AI_ACT"
     
     Returns:
         EvaluationResult with overall score and dimension breakdowns
@@ -171,7 +173,7 @@ def compute_all_metrics(
         all_metrics[m.name] = m
     
     # Dimension 6: Legal & Regulatory Compliance
-    lc_metrics = legal_compliance.compute(query, response, rag_documents, metadata)
+    lc_metrics = legal_compliance.compute(query, response, rag_documents, metadata, compliance_mode)
     
     # AGGRESSIVE SCORING: Section 8 violation forces entire dimension to 0
     section_8_details = metadata.get("section_8_details", {})
@@ -293,6 +295,7 @@ class MetricsEngine:
         response: str,
         rag_documents: List[Any],
         metadata: Optional[Dict[str, Any]] = None,
+        compliance_mode: str = "RTI",
     ) -> Dict[str, Any]:
         """Evaluate a query-response pair and return metrics."""
         # Convert dicts to RAGDocument if needed
@@ -313,6 +316,7 @@ class MetricsEngine:
             rag_documents=docs,
             metadata=metadata,
             weights=self.weights,
+            compliance_mode=compliance_mode,
         )
         
         # Convert to dict format

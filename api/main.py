@@ -22,6 +22,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from endurance.metrics import MetricsEngine
 from endurance.verification import VerificationPipeline
 from endurance.storage import get_mongo_engine
+from endurance.config.presets import PRESETS, get_preset
 
 app = FastAPI(
     title="Endurance API",
@@ -77,6 +78,8 @@ class EvaluateRequest(BaseModel):
     rag_documents: List[RAGDocument] = []
     metadata: Optional[Dict[str, Any]] = None
     custom_weights: Optional[Dict[str, float]] = None  # Dynamic dimension weights
+    compliance_mode: Optional[str] = None  # "RTI", "UK_GDPR", "EU_AI_ACT"
+    preset: Optional[str] = None  # Preset name from PRESETS (e.g., "uk_govt_standard")
 
 
 class EvaluateResponse(BaseModel):
@@ -114,13 +117,14 @@ class ServiceStats(BaseModel):
 # HELPER FUNCTIONS
 # ============================================
 
-def compute_dimensions(query: str, response: str, rag_docs: List[Dict]) -> Dict[str, float]:
+def compute_dimensions(query: str, response: str, rag_docs: List[Dict], compliance_mode: str = "RTI") -> Dict[str, float]:
     """Compute all dimension scores."""
     try:
         result = metrics_engine.evaluate(
             query=query,
             response=response,
             rag_documents=rag_docs,
+            compliance_mode=compliance_mode,
         )
         return result.get("dimensions", {})
     except Exception as e:
@@ -221,6 +225,46 @@ async def health_check():
     return {"status": "ok", "timestamp": datetime.now().isoformat()}
 
 
+@app.get("/v1/presets")
+async def get_presets():
+    """
+    List all available compliance presets.
+    
+    Presets provide pre-configured weights and compliance modes for different
+    jurisdictions and use cases (e.g., UK Government, EU AI Act).
+    """
+    presets_info = []
+    for key, preset in PRESETS.items():
+        presets_info.append({
+            "key": key,
+            "name": preset.get("name", key),
+            "description": preset.get("description", ""),
+            "compliance_mode": preset.get("compliance_mode", "RTI"),
+        })
+    return {
+        "presets": presets_info,
+        "total": len(presets_info),
+    }
+
+
+@app.get("/v1/compliance-modes")
+async def get_compliance_modes():
+    """
+    List valid compliance modes.
+    
+    - RTI: Indian Right to Information Act (default)
+    - UK_GDPR: UK GDPR + Freedom of Information Act
+    - EU_AI_ACT: EU AI Act high-risk system requirements
+    """
+    return {
+        "modes": [
+            {"key": "RTI", "name": "India RTI", "description": "Right to Information Act 2005 (India)"},
+            {"key": "UK_GDPR", "name": "UK GDPR", "description": "UK GDPR + Freedom of Information Act 2000"},
+            {"key": "EU_AI_ACT", "name": "EU AI Act", "description": "EU Artificial Intelligence Act (high-risk systems)"},
+        ],
+        "default": "RTI",
+    }
+
 @app.post("/v1/evaluate", response_model=EvaluateResponse)
 async def evaluate(request: EvaluateRequest):
     """
@@ -240,10 +284,23 @@ async def evaluate(request: EvaluateRequest):
         "similarity_score": getattr(doc, 'similarity_score', 0.0)
     } for doc in request.rag_documents]
     
-    # 3. Compute dimensions
-    dimensions = compute_dimensions(request.query, request.response, rag_docs)
+    # 3. Resolve preset -> weights + compliance_mode
+    weights = request.custom_weights
+    compliance_mode = request.compliance_mode or "RTI"
     
-    # 4. Compute verification
+    if request.preset and request.preset in PRESETS:
+        preset_data = get_preset(request.preset)
+        # Preset weights (if not overridden by custom_weights)
+        if weights is None:
+            weights = preset_data.get("weights", {})
+        # Preset compliance_mode (if not explicitly provided)
+        if request.compliance_mode is None:
+            compliance_mode = preset_data.get("compliance_mode", "RTI")
+    
+    # 4. Compute dimensions with compliance mode
+    dimensions = compute_dimensions(request.query, request.response, rag_docs, compliance_mode)
+    
+    # 5. Compute verification
     verification = compute_verification(request.response, rag_docs)
     
     # 5. Calculate overall score
