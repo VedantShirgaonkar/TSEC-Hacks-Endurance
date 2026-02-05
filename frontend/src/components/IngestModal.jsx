@@ -53,7 +53,7 @@ const IngestModal = ({ isOpen, onClose }) => {
             // Convert to base64 for safe transmission
             const base64Content = btoa(unescape(encodeURIComponent(content)));
 
-            const response = await fetch('https://onehhynrll.execute-api.ap-south-1.amazonaws.com/prod/ingest', {
+            const response = await fetch('/api/ingest', {
                 method: 'POST',
                 headers: {
                     'Content-Type': 'application/json',
@@ -131,10 +131,10 @@ const IngestModal = ({ isOpen, onClose }) => {
                         onDrop={handleDrop}
                         onClick={() => fileInputRef.current?.click()}
                         className={`relative flex flex-col items-center justify-center p-8 border-2 border-dashed rounded-xl cursor-pointer transition-all duration-300 ${isDragging
-                                ? 'border-accent-primary bg-accent-primary/10 scale-[1.02]'
-                                : file
-                                    ? 'border-accent-primary/50 bg-accent-primary/5'
-                                    : 'border-border-subtle hover:border-text-tertiary hover:bg-white/5'
+                            ? 'border-accent-primary bg-accent-primary/10 scale-[1.02]'
+                            : file
+                                ? 'border-accent-primary/50 bg-accent-primary/5'
+                                : 'border-border-subtle hover:border-text-tertiary hover:bg-white/5'
                             }`}
                     >
                         <input
@@ -169,8 +169,8 @@ const IngestModal = ({ isOpen, onClose }) => {
                     {/* Status Message */}
                     {uploadStatus && (
                         <div className={`mt-4 p-3 rounded-lg flex items-center gap-2 text-sm ${uploadStatus === 'success'
-                                ? 'bg-green-500/10 text-green-400 border border-green-500/20'
-                                : 'bg-red-500/10 text-red-400 border border-red-500/20'
+                            ? 'bg-green-500/10 text-green-400 border border-green-500/20'
+                            : 'bg-red-500/10 text-red-400 border border-red-500/20'
                             }`}>
                             {uploadStatus === 'success' ? <Check size={16} /> : <AlertCircle size={16} />}
                             {statusMessage}
@@ -182,8 +182,8 @@ const IngestModal = ({ isOpen, onClose }) => {
                         onClick={handleUpload}
                         disabled={!file || isUploading}
                         className={`w-full mt-4 py-3 px-4 rounded-xl font-medium text-sm transition-all duration-300 flex items-center justify-center gap-2 ${!file || isUploading
-                                ? 'bg-white/5 text-text-tertiary cursor-not-allowed'
-                                : 'bg-accent-primary text-white hover:bg-accent-primary/90 shadow-lg shadow-accent-primary/20'
+                            ? 'bg-white/5 text-text-tertiary cursor-not-allowed'
+                            : 'bg-accent-primary text-white hover:bg-accent-primary/90 shadow-lg shadow-accent-primary/20'
                             }`}
                     >
                         {isUploading ? (
