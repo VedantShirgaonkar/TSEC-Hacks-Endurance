@@ -4,9 +4,12 @@ Dimension 8: Response Quality
 Metrics:
 - Accuracy Score
 - Completeness Score
-- Precision Score
+- Relevance Score
 - F1 Score (combined)
-- Task Completion Rate
+- Confidence Level (hedging density)
+
+Research Alignment:
+- Linguistic Uncertainty: Detects hedging language as proxy for confidence
 """
 
 from typing import List, Dict, Any
@@ -73,6 +76,18 @@ def compute(
         raw_value=f1,
         normalized_score=normalize_score(f1, 0, 1),
         explanation="F1 score balancing precision and recall"
+    ))
+    
+    # Metric 5: Confidence Level (inverse of hedging density)
+    # Research: Linguistic uncertainty detection as proxy for model confidence
+    hedging_density = calculate_hedging_density(response)
+    confidence = 1.0 - hedging_density  # Low hedging = high confidence
+    metrics.append(MR(
+        name="confidence_level",
+        dimension="response_quality",
+        raw_value=confidence,
+        normalized_score=normalize_score(confidence, 0, 1),
+        explanation=f"Response confidence (hedging density: {hedging_density*100:.0f}%)"
     ))
     
     return metrics
@@ -206,3 +221,92 @@ def calculate_f1_score(precision: float, recall: float) -> float:
     
     f1 = 2 * (precision * recall) / (precision + recall)
     return f1
+
+
+def calculate_hedging_density(response: str) -> float:
+    """
+    Calculate hedging density - a proxy for linguistic uncertainty.
+    
+    Research Alignment (XAI_RESEARCH_ANALYSIS_V1.md):
+    - Hedging language indicates model uncertainty without probabilities
+    - Phrases like "might", "possibly", "unclear" suggest low confidence
+    
+    Returns:
+        float: 0.0 (no hedging) to 1.0 (heavily hedged response)
+    
+    Note:
+        - "approximate" is only flagged if NOT followed by a number
+        - Higher density = lower confidence = potential concern
+    """
+    if not response:
+        return 0.0
+    
+    response_lower = response.lower()
+    word_count = len(response.split())
+    
+    if word_count == 0:
+        return 0.0
+    
+    # Hedging patterns with their weights (higher = stronger uncertainty signal)
+    HEDGING_PATTERNS = [
+        # Modal uncertainty
+        (r'\bmaybe\b', 1.0),
+        (r'\bperhaps\b', 1.0),
+        (r'\bpossibly\b', 1.0),
+        (r'\bmight\b', 0.8),
+        (r'\bcould be\b', 0.8),
+        (r'\bmay be\b', 0.8),
+        
+        # Evidential hedges
+        (r'\bseems to\b', 0.9),
+        (r'\bappears to\b', 0.9),
+        (r'\bi guess\b', 1.0),
+        (r'\bi think\b', 0.7),  # Lower weight as could be stylistic
+        (r'\bi believe\b', 0.6),
+        
+        # Epistemic uncertainty
+        (r'\bunclear\b', 1.0),
+        (r'\bnot sure\b', 1.0),
+        (r'\buncertain\b', 1.0),
+        (r'\bprobably\b', 0.7),
+        (r'\blikely\b', 0.5),  # Lower weight as can be factual
+        
+        # Approximation hedges (only if NOT followed by a number)
+        (r'\bapproximate(?:ly)?\b(?!\s*\d)', 0.8),
+        (r'\babout\b(?!\s*\d)', 0.4),  # Lower weight, common non-hedge usage
+        (r'\baround\b(?!\s*\d)', 0.4),
+        (r'\broughly\b(?!\s*\d)', 0.6),
+        
+        # Vagueness markers
+        (r'\bsomewhat\b', 0.7),
+        (r'\bsort of\b', 0.8),
+        (r'\bkind of\b', 0.8),
+        (r'\bmore or less\b', 0.9),
+        
+        # Attribution hedges (shifting responsibility)
+        (r'\bsome say\b', 0.8),
+        (r'\bit is said\b', 0.7),
+        (r'\breportedly\b', 0.6),
+        (r'\ballegedly\b', 0.9),
+    ]
+    
+    total_hedge_score = 0.0
+    hedge_count = 0
+    
+    for pattern, weight in HEDGING_PATTERNS:
+        matches = re.findall(pattern, response_lower)
+        if matches:
+            hedge_count += len(matches)
+            total_hedge_score += len(matches) * weight
+    
+    # Normalize by response length (per 100 words)
+    # A response with 1 hedge per 20 words is heavily hedged
+    hedges_per_100_words = (hedge_count / word_count) * 100
+    
+    # Map to 0-1 scale
+    # 0 hedges = 0.0 density
+    # 5+ hedges per 100 words = 1.0 density (very uncertain)
+    MAX_HEDGES_PER_100 = 5.0
+    density = min(hedges_per_100_words / MAX_HEDGES_PER_100, 1.0)
+    
+    return density
