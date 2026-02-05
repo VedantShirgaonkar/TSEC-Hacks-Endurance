@@ -1,7 +1,7 @@
 """
 Metrics Engine - Computes all ethical dimension scores.
 
-9 Dimensions:
+10 Dimensions:
 1. Bias & Fairness
 2. Data Grounding & Drift  
 3. Explainability & Transparency
@@ -11,6 +11,7 @@ Metrics Engine - Computes all ethical dimension scores.
 7. Security & Robustness
 8. Response Quality
 9. Environmental & Cost
+10. Reasoning Quality (optional - when reasoning_trace available)
 """
 
 from typing import Dict, List, Any, Optional
@@ -27,6 +28,7 @@ from endurance.metrics.dimensions import (
     security,
     response_quality,
     environmental_cost,
+    reasoning_quality,
 )
 from endurance.metrics.normalizer import normalize_score
 from endurance.metrics.aggregator import aggregate_dimensions
@@ -93,9 +95,10 @@ def compute_all_metrics(
     metadata: Optional[Dict[str, Any]] = None,
     weights: Optional[Dict[str, float]] = None,
     compliance_mode: str = "RTI",
+    reasoning_trace: Optional[str] = None,
 ) -> EvaluationResult:
     """
-    Compute all metrics across 9 ethical dimensions.
+    Compute all metrics across 10 ethical dimensions.
     
     Args:
         query: The user's query/question
@@ -104,6 +107,7 @@ def compute_all_metrics(
         metadata: Optional metadata (tokens, latency, model, etc.)
         weights: Optional custom dimension weights
         compliance_mode: "RTI" (India), "UK_GDPR", or "EU_AI_ACT"
+        reasoning_trace: Optional chain-of-thought from reasoning models
     
     Returns:
         EvaluationResult with overall score and dimension breakdowns
@@ -229,6 +233,19 @@ def compute_all_metrics(
     for m in ec_metrics:
         all_metrics[m.name] = m
     
+    # Dimension 10: Reasoning Quality (OPTIONAL - only when reasoning_trace provided)
+    if reasoning_trace:
+        rq_metrics = reasoning_quality.compute(query, response, rag_documents, metadata, reasoning_trace)
+        if rq_metrics:  # Only add if metrics were computed
+            rq_result = DimensionResult(
+                name="Reasoning Quality",
+                score=np.mean([m.normalized_score for m in rq_metrics]),
+                metrics=rq_metrics
+            )
+            dimension_results["reasoning_quality"] = rq_result
+            for m in rq_metrics:
+                all_metrics[m.name] = m
+    
     # Aggregate overall score
     overall_score = aggregate_dimensions(dimension_results, weights)
     
@@ -249,7 +266,9 @@ def compute_all_metrics(
         "security": "Protection against prompt injection and data leakage",
         "response_quality": "Accuracy and completeness of response",
         "environmental_cost": "Inference cost efficiency",
+        "reasoning_quality": "Chain-of-thought quality and grounding",
     }
+
     
     # Sort dimensions by score (ascending) and take bottom 3
     sorted_dims = sorted(dimension_results.items(), key=lambda x: x[1].score)
@@ -296,6 +315,7 @@ class MetricsEngine:
         rag_documents: List[Any],
         metadata: Optional[Dict[str, Any]] = None,
         compliance_mode: str = "RTI",
+        reasoning_trace: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Evaluate a query-response pair and return metrics."""
         # Convert dicts to RAGDocument if needed
@@ -317,6 +337,7 @@ class MetricsEngine:
             metadata=metadata,
             weights=self.weights,
             compliance_mode=compliance_mode,
+            reasoning_trace=reasoning_trace,
         )
         
         # Convert to dict format

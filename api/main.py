@@ -80,6 +80,7 @@ class EvaluateRequest(BaseModel):
     custom_weights: Optional[Dict[str, float]] = None  # Dynamic dimension weights
     compliance_mode: Optional[str] = None  # "RTI", "UK_GDPR", "EU_AI_ACT"
     preset: Optional[str] = None  # Preset name from PRESETS (e.g., "uk_govt_standard")
+    reasoning_trace: Optional[str] = None  # Chain-of-thought from reasoning models
 
 
 class EvaluateResponse(BaseModel):
@@ -117,7 +118,13 @@ class ServiceStats(BaseModel):
 # HELPER FUNCTIONS
 # ============================================
 
-def compute_dimensions(query: str, response: str, rag_docs: List[Dict], compliance_mode: str = "RTI") -> Dict[str, float]:
+def compute_dimensions(
+    query: str,
+    response: str,
+    rag_docs: List[Dict],
+    compliance_mode: str = "RTI",
+    reasoning_trace: Optional[str] = None,
+) -> Dict[str, float]:
     """Compute all dimension scores."""
     try:
         result = metrics_engine.evaluate(
@@ -125,6 +132,7 @@ def compute_dimensions(query: str, response: str, rag_docs: List[Dict], complian
             response=response,
             rag_documents=rag_docs,
             compliance_mode=compliance_mode,
+            reasoning_trace=reasoning_trace,
         )
         return result.get("dimensions", {})
     except Exception as e:
@@ -297,8 +305,14 @@ async def evaluate(request: EvaluateRequest):
         if request.compliance_mode is None:
             compliance_mode = preset_data.get("compliance_mode", "RTI")
     
-    # 4. Compute dimensions with compliance mode
-    dimensions = compute_dimensions(request.query, request.response, rag_docs, compliance_mode)
+    # 4. Compute dimensions with compliance mode and reasoning trace
+    dimensions = compute_dimensions(
+        request.query, 
+        request.response, 
+        rag_docs, 
+        compliance_mode,
+        reasoning_trace=request.reasoning_trace,
+    )
     
     # 5. Compute verification
     verification = compute_verification(request.response, rag_docs)
