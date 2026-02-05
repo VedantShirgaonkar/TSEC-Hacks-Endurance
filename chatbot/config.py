@@ -44,6 +44,10 @@ LLM_MODEL = "llama-3.3-70b-versatile"  # Groq model
 LLM_TEMPERATURE = 0.1  # Low temperature for factual responses
 LLM_MAX_TOKENS = 1024
 
+# Reasoning Model Settings (for chain-of-thought analysis)
+REASONING_MODEL = "openai/gpt-oss-120b"  # Model with reasoning capability
+REASONING_EFFORT = os.getenv("REASONING_EFFORT", "medium")  # low, medium, high
+
 # Embedding Settings
 EMBEDDING_MODEL = "text-embedding-3-small"  # OpenAI
 CHUNK_SIZE = 500

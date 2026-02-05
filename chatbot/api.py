@@ -59,6 +59,8 @@ class ChatRequest(BaseModel):
     message: str
     session_id: Optional[str] = None
     include_evaluation: bool = True  # Whether to run Endurance evaluation
+    enable_reasoning: bool = Field(default=False, description="Enable reasoning trace with reasoning model")
+    reasoning_effort: str = Field(default="medium", description="Reasoning effort: low, medium, high")
 
 
 class ChatResponse(BaseModel):
@@ -68,6 +70,8 @@ class ChatResponse(BaseModel):
     sources: List[Dict[str, Any]]
     evaluation: Optional[Dict[str, Any]] = None
     timestamp: str
+    reasoning_trace: Optional[str] = None
+    model_used: Optional[str] = None
 
 
 class SourceDocument(BaseModel):
@@ -198,6 +202,7 @@ async def ingest_document(request: IngestRequest):
 async def chat(request: ChatRequest):
     """
     Send a message to the chatbot and get a response.
+    Optionally enables reasoning trace for chain-of-thought analysis.
     Optionally sends telemetry to Endurance (fire-and-forget).
     """
     import uuid
@@ -207,12 +212,23 @@ async def chat(request: ChatRequest):
     timestamp = datetime.now().isoformat()
     
     try:
-        # Get RAG chain and query
+        # Get RAG chain
         rag_chain = get_rag_chain()
-        result = rag_chain.query(request.message)
+        
+        # Query with or without reasoning based on toggle
+        if request.enable_reasoning:
+            result = rag_chain.query_with_reasoning(
+                request.message, 
+                reasoning_effort=request.reasoning_effort
+            )
+        else:
+            result = rag_chain.query(request.message)
         
         response_text = result["answer"]
         rag_documents = result["rag_documents"]
+        reasoning_trace = result.get("reasoning_trace")
+        model_used = result.get("model_used")
+        metadata = result.get("metadata", {})
         
         # Format sources for response
         sources = [
@@ -231,6 +247,8 @@ async def chat(request: ChatRequest):
                 query=request.message,
                 response=response_text,
                 rag_documents=rag_documents,
+                reasoning_trace=reasoning_trace,
+                metadata=metadata,
             )
         
         return ChatResponse(
@@ -240,6 +258,8 @@ async def chat(request: ChatRequest):
             sources=sources,
             evaluation=evaluation_result,
             timestamp=timestamp,
+            reasoning_trace=reasoning_trace,
+            model_used=model_used,
         )
         
     except Exception as e:
@@ -251,30 +271,43 @@ async def send_to_endurance(
     query: str,
     response: str,
     rag_documents: List[Dict[str, Any]],
+    reasoning_trace: Optional[str] = None,
+    metadata: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """
     Send telemetry to Endurance API and return evaluation result.
     Errors are logged but don't crash the chatbot.
     """
     try:
+        # Build payload
+        payload = {
+            "session_id": session_id,
+            "query": query,
+            "response": response,
+            "service_id": "rti_chatbot",
+            "rag_documents": [
+                {
+                    "source": doc.get("source", "unknown"),
+                    "content": doc.get("content", ""),
+                    "id": doc.get("id", ""),
+                    "similarity_score": doc.get("similarity_score", 0.0)
+                }
+                for doc in rag_documents
+            ],
+        }
+        
+        # Add optional reasoning trace
+        if reasoning_trace:
+            payload["reasoning_trace"] = reasoning_trace
+        
+        # Add optional metadata
+        if metadata:
+            payload["metadata"] = metadata
+        
         async with httpx.AsyncClient(timeout=10.0) as client:
             eval_response = await client.post(
                 f"{ENDURANCE_URL}/v1/evaluate",
-                json={
-                    "session_id": session_id,
-                    "query": query,
-                    "response": response,
-                    "service_id": "rti_chatbot",
-                    "rag_documents": [
-                        {
-                            "source": doc.get("source", "unknown"),
-                            "content": doc.get("content", ""),
-                            "id": doc.get("id", ""),
-                            "similarity_score": doc.get("similarity_score", 0.0)
-                        }
-                        for doc in rag_documents
-                    ],
-                },
+                json=payload,
             )
             if eval_response.status_code == 200:
                 return eval_response.json()

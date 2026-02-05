@@ -25,6 +25,8 @@ from chatbot.config import (
     CHUNK_OVERLAP,
     TOP_K_DOCUMENTS,
     SYSTEM_PROMPT,
+    REASONING_MODEL,
+    REASONING_EFFORT,
 )
 
 
@@ -220,6 +222,98 @@ class S3RAGChain:
             "source_documents": docs,
             "rag_documents": rag_documents,
             "query": question,
+            "model_used": LLM_MODEL,
+            "reasoning_trace": None,
+        }
+    
+    def query_with_reasoning(self, question: str, reasoning_effort: str = None) -> Dict[str, Any]:
+        """
+        Query the RAG chain with reasoning trace enabled.
+        Uses Groq SDK directly to get structured reasoning output.
+        
+        Args:
+            question: The user's question
+            reasoning_effort: "low", "medium", or "high" (defaults to config value)
+        
+        Returns:
+            Dict with 'answer', 'reasoning_trace', 'source_documents', and metadata
+        """
+        from groq import Groq
+        import time
+        
+        if not self._initialized:
+            self.initialize()
+        
+        effort = reasoning_effort or REASONING_EFFORT
+        
+        # Get relevant documents with scores
+        doc_score_pairs = self._get_similar_documents(question)
+        docs = [doc for doc, score in doc_score_pairs]
+        
+        # Format context
+        context = self._format_docs(docs)
+        
+        # Build the full prompt
+        full_prompt = SYSTEM_PROMPT.format(context=context, question=question)
+        
+        # Use Groq SDK directly for reasoning
+        client = Groq(api_key=GROQ_API_KEY)
+        
+        start_time = time.time()
+        
+        try:
+            response = client.chat.completions.create(
+                model=REASONING_MODEL,
+                messages=[
+                    {"role": "user", "content": full_prompt},
+                ],
+                max_tokens=LLM_MAX_TOKENS,
+                temperature=LLM_TEMPERATURE,
+            )
+            
+            latency_ms = int((time.time() - start_time) * 1000)
+            
+            # Extract answer and reasoning
+            message = response.choices[0].message
+            answer = message.content
+            
+            # Extract reasoning trace (may be in different locations depending on model)
+            reasoning_trace = None
+            if hasattr(message, 'reasoning') and message.reasoning:
+                reasoning_trace = message.reasoning
+            elif hasattr(message, 'reasoning_content') and message.reasoning_content:
+                reasoning_trace = message.reasoning_content
+            
+            # Get token usage
+            tokens_used = response.usage.total_tokens if response.usage else None
+            
+        except Exception as e:
+            print(f"[S3-RAG] Reasoning query error: {e}")
+            # Fall back to regular query if reasoning fails
+            return self.query(question)
+        
+        # Format source documents for Endurance
+        rag_documents = []
+        for i, (doc, score) in enumerate(doc_score_pairs):
+            rag_documents.append({
+                "id": f"doc_{i}",
+                "source": doc.metadata.get("source_name", f"document_{i}"),
+                "content": doc.page_content,
+                "similarity_score": score,
+            })
+        
+        return {
+            "answer": answer,
+            "reasoning_trace": reasoning_trace,
+            "source_documents": docs,
+            "rag_documents": rag_documents,
+            "query": question,
+            "model_used": REASONING_MODEL,
+            "metadata": {
+                "reasoning_effort": effort,
+                "tokens_used": tokens_used,
+                "latency_ms": latency_ms,
+            }
         }
     
     def get_relevant_documents(self, question: str) -> List[Dict[str, Any]]:
